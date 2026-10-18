@@ -37,7 +37,7 @@ popd
 if not "%ERR%"=="0" goto :fail
 
 echo.
-echo Done. SnapPatch.exe (version 3.5) is in: %OUT%
+echo Done. SnapPatch.exe (version 4.1) is in: %OUT%
 echo To make a one-click installer for colleagues, run build_installer.bat next.
 if "%1"=="" explorer "%OUT%"
 if "%1"=="" pause

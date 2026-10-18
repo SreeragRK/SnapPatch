@@ -33,6 +33,7 @@ from PIL import Image, ImageTk, ImageDraw, ImageFont, ImageGrab
 import logging
 import traceback
 import subprocess
+import struct
 
 try:
     import numpy as np
@@ -62,7 +63,7 @@ def ffmpeg_exe():
 
 
 APP_NAME = "SnapPatch"
-APP_VERSION = "3.5"
+APP_VERSION = "4.1"
 
 
 def resource_path(name):
@@ -115,6 +116,18 @@ MAX_UNDO = 60
 PROJECT_EXT = ".snappatch"
 LIBRARY_DIR = Path.home() / "Pictures" / "SnapPatch"
 HIGHLIGHT_COLOR = "#ffe600"
+
+# --- ToolRoom help-image guidelines (Confluence: AMT ToolRoom KB -> Help Image Design Guide) ---------
+HELP_PRESETS = {                       # name: (width, height, format)
+    "ToolRoom help image 268 × 358": (268, 358, "png"),
+    "BlankX help image 265 × 265": (265, 265, "png"),
+    "TGP operation image 270 × 149 (jpg)": (270, 149, "jpg"),
+}
+HELP_BG = (0, 75, 44)                  # green background
+HELP_COLOURS = [("Arrow / dimension", "#f87100"),    # RGB 248,113,0
+                ("Reference line", "#a523d2"),       # RGB 165,35,210
+                ("Axis line", "#000000")]
+HELP_TEXT_OK = set("0123456789+-±×÷=.,:;%°()/ ")      # numbers and operators are allowed, words are not
 PALETTE = ["#ff0000", "#ff8c00", "#ffe600", "#00b050", "#0a64ff", "#7030a0", "#000000", "#ffffff"]
 UI_FONT = ("Segoe UI", 10)
 LOG_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "SnapPatch"
@@ -159,8 +172,9 @@ if IS_WIN:
 # =========================================================================== #
 #  Windows helpers
 # =========================================================================== #
-def copy_image_to_clipboard(img, hwnd=None):
-    """Put an image on the Windows clipboard as CF_DIB (every app) and PNG (Teams, browsers, Office).
+def copy_image_to_clipboard(img, hwnd=None, file_path=None):
+    """Put an image on the Windows clipboard as CF_DIB (every app), PNG (Teams, browsers, Office) and –
+    if file_path is given – as a file (CF_HDROP) so Ctrl+V in Explorer / Outlook attachments works too.
     hwnd: owner window – without one, EmptyClipboard makes SetClipboardData fail on recent Windows."""
     if not IS_WIN:
         raise RuntimeError("Copying images to the clipboard is only supported on Windows.")
@@ -172,6 +186,11 @@ def copy_image_to_clipboard(img, hwnd=None):
     pbuf = io.BytesIO()
     img.convert("RGBA" if img.mode == "RGBA" else "RGB").save(pbuf, "PNG")
     png = pbuf.getvalue()
+    hdrop = None
+    if file_path:
+        # DROPFILES header (20 bytes) + UTF-16 path list ending with a double NUL
+        path_bytes = (str(file_path) + "\0\0").encode("utf-16-le")
+        hdrop = struct.pack("<IiiII", 20, 0, 0, 0, 1) + path_bytes
 
     k32, u32 = ctypes.windll.kernel32, ctypes.windll.user32
     k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
@@ -214,6 +233,11 @@ def copy_image_to_clipboard(img, hwnd=None):
             put(u32.RegisterClipboardFormatW("PNG"), png)       # PNG – keeps transparency, preferred by many apps
         except Exception:
             pass
+        if hdrop:
+            try:
+                put(15, hdrop)                                  # CF_HDROP – paste as a file in Explorer
+            except Exception:
+                log.exception("CF_HDROP failed")
     finally:
         u32.CloseClipboard()
 
@@ -585,7 +609,25 @@ def get_font(size, bold=False):
 
 
 _measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-BOX_TYPES = ("rect", "rrect", "frect", "ellipse", "highlight", "blur", "spotlight")
+BOX_TYPES = ("rect", "rrect", "frect", "ellipse", "star", "triangle", "diamond", "arc", "symbol", "highlight", "blur",
+             "spotlight")
+DASHABLE = ("line", "arrow", "darrow", "pen", "rect", "ellipse", "arc")
+
+
+def shape_points(t, box):
+    """Outline points for the polygon shapes, fitted into box."""
+    x0, y0, x1, y1 = box
+    cx, cy, rx, ry = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2
+    if t == "triangle":
+        return [(cx, y0), (x1, y1), (x0, y1)]
+    if t == "diamond":
+        return [(cx, y0), (x1, cy), (cx, y1), (x0, cy)]
+    pts = []                                              # 5-point star
+    for i in range(10):
+        a = math.radians(-90 + i * 36)
+        f = 1.0 if i % 2 == 0 else 0.42
+        pts.append((cx + rx * f * math.cos(a), cy + ry * f * math.sin(a)))
+    return pts
 LINE_TYPES = ("line", "arrow", "darrow")
 
 
@@ -659,7 +701,31 @@ def step_radius(o):
     return max(10, int(o["size"] * 0.85))
 
 
+ROTATABLE = ("rect", "rrect", "frect", "ellipse", "star", "triangle", "diamond", "arc", "symbol", "text", "callout",
+             "line", "arrow", "darrow", "pen")
+
+
+def rotate_pt(p, c, deg):
+    """Rotate point p around centre c by deg degrees clockwise (screen coordinates, y down)."""
+    a = math.radians(deg)
+    dx, dy = p[0] - c[0], p[1] - c[1]
+    return c[0] + dx * math.cos(a) - dy * math.sin(a), c[1] + dx * math.sin(a) + dy * math.cos(a)
+
+
+def unrotated(o):
+    """Copy of the object without its rotation (geometry as drawn)."""
+    o2 = dict(o)
+    o2.pop("angle", None)
+    return o2
+
+
 def obj_bbox(o):
+    ang = o.get("angle", 0) % 360
+    if ang and o["type"] in ROTATABLE:
+        l, t, r, b = obj_bbox(unrotated(o))
+        c = ((l + r) / 2, (t + b) / 2)
+        pts = [rotate_pt(p, c, ang) for p in ((l, t), (r, t), (l, b), (r, b))]
+        return (min(p[0] for p in pts), min(p[1] for p in pts), max(p[0] for p in pts), max(p[1] for p in pts))
     t = o["type"]
     if t == "pen":
         xs = [p[0] for p in o["pts"]]
@@ -702,7 +768,7 @@ def hit_object(objects, x, y, tol):
         else:
             l, t, r, b = obj_bbox(o)
             if l - tol <= x <= r + tol and t - tol <= y <= b + tol:
-                if o["type"] in ("rect", "rrect", "ellipse", "spotlight"):
+                if o["type"] in ("rect", "rrect", "ellipse", "spotlight") and not o.get("fill"):
                     # outline shapes: only the outline is clickable, so you can draw inside them
                     m = tol + o.get("width", 3) / 2 + 2
                     if l + m < x < r - m and t + m < y < b - m:
@@ -712,6 +778,8 @@ def hit_object(objects, x, y, tol):
 
 
 def obj_handles(o):
+    if o.get("angle", 0) % 360:
+        return []            # rotated objects: move / rotate / restyle only; set angle to 0 to resize by handles
     if o["type"] in LINE_TYPES:
         return [(o["x0"], o["y0"]), (o["x1"], o["y1"])]
     if o["type"] in BOX_TYPES:
@@ -769,19 +837,135 @@ def _head(d, tip, ang, L, color):
                (tip[0] - L * math.cos(ang + 0.45), tip[1] - L * math.sin(ang + 0.45))], fill=color)
 
 
-def draw_arrow(d, a, b, color, w, arrow, both=False):
+def polyline(d, pts, color, w, dash=None, mid_arrows=False, head_len=None):
+    """Draw a path; dash = (on, off) px for a dashed line; mid_arrows puts an arrowhead at the middle
+    of each segment (or every ~70 px of a long path) pointing in the drawing direction."""
+    if len(pts) < 2:
+        return
+    if not dash:
+        d.line(pts, fill=color, width=w, joint="curve")
+    else:
+        on, off = dash
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            seg = math.hypot(x1 - x0, y1 - y0)
+            if seg == 0:
+                continue
+            ux, uy = (x1 - x0) / seg, (y1 - y0) / seg
+            pos = 0.0
+            while pos < seg:
+                end = min(seg, pos + on)
+                d.line([(x0 + ux * pos, y0 + uy * pos), (x0 + ux * end, y0 + uy * end)], fill=color, width=w)
+                pos += on + off
+    if mid_arrows:
+        L = head_len or max(10, w * 3.5)
+        total = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
+        step = 70 if total > 140 else total / 2
+        target, run = step, 0.0
+        for a, b in zip(pts, pts[1:]):
+            seg = math.hypot(b[0] - a[0], b[1] - a[1])
+            while seg > 0 and target <= run + seg:
+                f = (target - run) / seg
+                tip = (a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f)
+                _head(d, tip, math.atan2(b[1] - a[1], b[0] - a[0]), L, color)
+                target += step
+            run += seg
+
+
+def draw_arrow(d, a, b, color, w, arrow, both=False, dash=None, mid_arrows=False):
     if not arrow:
-        d.line([a, b], fill=color, width=w)
+        polyline(d, [a, b], color, w, dash, mid_arrows)
         return
     ang = math.atan2(b[1] - a[1], b[0] - a[0])
     L = max(12, w * 4)
     base_b = (b[0] - L * 0.8 * math.cos(ang), b[1] - L * 0.8 * math.sin(ang))
     base_a = (a[0] + L * 0.8 * math.cos(ang), a[1] + L * 0.8 * math.sin(ang)) if both else a
     if math.hypot(b[0] - a[0], b[1] - a[1]) > L * (1.6 if both else 0.8):
-        d.line([base_a, base_b], fill=color, width=w)
+        polyline(d, [base_a, base_b], color, w, dash, mid_arrows)
     _head(d, b, ang, L, color)
     if both:
         _head(d, a, ang + math.pi, L, color)
+
+
+def ellipse_points(box, n=72):
+    x0, y0, x1, y1 = box
+    cx, cy, rx, ry = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2
+    return [(cx + rx * math.cos(2 * math.pi * i / n), cy + ry * math.sin(2 * math.pi * i / n)) for i in range(n + 1)]
+
+
+def arc_points(box, start, end, n=48):
+    """Points along an ellipse arc from start to end degrees (clockwise on screen, 0 = right)."""
+    x0, y0, x1, y1 = box
+    cx, cy, rx, ry = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2
+    if end <= start:
+        end += 360
+    return [(cx + rx * math.cos(math.radians(start + (end - start) * i / n)),
+             cy + ry * math.sin(math.radians(start + (end - start) * i / n))) for i in range(n + 1)]
+
+
+SYMBOLS = [("no", "No / not allowed (red circle + slash)"), ("probe", "Probe – standard tip"),
+           ("ruby", "Probe – ruby tip"), ("stopwatch", "Stopwatch (feed rate)"),
+           ("thermo", "Thermometer (temperature)"), ("plusminus", "± sign"), ("plus", "+ sign"), ("minus", "− sign"),
+           ("rotate_cw", "Rotation clockwise"), ("rotate_ccw", "Rotation anti-clockwise")]
+
+
+def draw_symbol(d, kind, box, color, w):
+    """Vector versions of the common ToolRoom help-image objects, fitted into box."""
+    x0, y0, x1, y1 = box
+    bw, bh = max(2, x1 - x0), max(2, y1 - y0)
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    if kind == "no":
+        lw = max(3, int(min(bw, bh) * 0.11))
+        d.ellipse((x0 + lw / 2, y0 + lw / 2, x1 - lw / 2, y1 - lw / 2), outline="#ff0000", width=lw)
+        r = (min(bw, bh) - lw) / 2 * 0.72
+        d.line([(cx - r, cy - r), (cx + r, cy + r)], fill="#ff0000", width=lw)
+    elif kind in ("probe", "ruby"):
+        ball = min(bw, bh * 0.28) / 2
+        stem_w = max(2, ball * 0.45)
+        d.line([(cx, y0), (cx, y1 - ball * 2)], fill="#e8e8e8", width=int(stem_w * 2))
+        d.line([(cx - stem_w * 0.5, y0), (cx - stem_w * 0.5, y1 - ball * 2)], fill="#ffffff", width=max(1, int(stem_w * 0.6)))
+        d.line([(cx + stem_w * 0.6, y0), (cx + stem_w * 0.6, y1 - ball * 2)], fill="#b0b0b0", width=max(1, int(stem_w * 0.5)))
+        bc, hl = ("#c8102e", "#ff7b8a") if kind == "ruby" else ("#d9534f", "#ffb3ae")
+        d.ellipse((cx - ball, y1 - ball * 2, cx + ball, y1), fill=bc, outline="#7a0f1f", width=1)
+        d.ellipse((cx - ball * 0.55, y1 - ball * 1.75, cx - ball * 0.1, y1 - ball * 1.25), fill=hl)
+    elif kind == "stopwatch":
+        r = min(bw, bh * 0.8) / 2
+        cyy = y1 - r
+        lw = max(2, int(r * 0.12))
+        d.rectangle((cx - r * 0.18, y0, cx + r * 0.18, y0 + r * 0.35), fill="#333333")
+        d.rectangle((cx - r * 0.35, y0 + r * 0.25, cx + r * 0.35, y0 + r * 0.45), fill="#333333")
+        d.ellipse((cx - r, cyy - r, cx + r, cyy + r), fill="#ffffff", outline="#333333", width=lw)
+        for k in range(12):
+            a = math.radians(k * 30)
+            d.line([(cx + r * 0.8 * math.cos(a), cyy + r * 0.8 * math.sin(a)),
+                    (cx + r * 0.92 * math.cos(a), cyy + r * 0.92 * math.sin(a))], fill="#333333", width=max(1, lw // 2))
+        d.line([(cx, cyy), (cx + r * 0.55, cyy - r * 0.45)], fill="#d9534f", width=max(2, lw))
+        d.ellipse((cx - lw, cyy - lw, cx + lw, cyy + lw), fill="#333333")
+    elif kind == "thermo":
+        tw = max(4, bw * 0.35)
+        bulb = min(bw, tw * 2) / 2
+        lw = max(2, int(tw * 0.25))
+        d.rounded_rectangle((cx - tw / 2, y0, cx + tw / 2, y1 - bulb), radius=tw / 2, fill="#ffffff",
+                            outline="#111111", width=lw)
+        d.rectangle((cx - tw * 0.18, y0 + bh * 0.35, cx + tw * 0.18, y1 - bulb), fill="#e00000")
+        d.ellipse((cx - bulb, y1 - bulb * 2, cx + bulb, y1), fill="#e00000", outline="#111111", width=lw)
+    elif kind in ("plus", "minus", "plusminus"):
+        lw = max(2, int(min(bw, bh) * 0.14))
+        if kind == "plusminus":
+            d.line([(x0, cy - bh * 0.15), (x1, cy - bh * 0.15)], fill=color, width=lw)
+            d.line([(cx, y0), (cx, cy + bh * 0.05)], fill=color, width=lw)
+            d.line([(x0, y1 - lw / 2), (x1, y1 - lw / 2)], fill=color, width=lw)
+        else:
+            d.line([(x0, cy), (x1, cy)], fill=color, width=lw)
+            if kind == "plus":
+                d.line([(cx, y0), (cx, y1)], fill=color, width=lw)
+    elif kind in ("rotate_cw", "rotate_ccw"):
+        lw = max(2, w)
+        pts = arc_points((x0 + lw, y0 + lw, x1 - lw, y1 - lw), 300, 210)   # open ring, gap at top-right
+        if kind == "rotate_ccw":
+            pts = pts[::-1]
+        polyline(d, pts, color, lw)
+        a, b = pts[-2], pts[-1]
+        _head(d, b, math.atan2(b[1] - a[1], b[0] - a[0]), max(10, lw * 3.5), color)
 
 
 def clip_box(box, size):
@@ -789,27 +973,75 @@ def clip_box(box, size):
     return max(0, x0), max(0, y0), min(size[0], x1), min(size[1], y1)
 
 
+def paste_layer(out, layer, x, y):
+    """Alpha-composite an RGBA layer onto out at (x, y); parts outside the image are clipped."""
+    x, y = int(round(x)), int(round(y))
+    sx0, sy0 = max(0, -x), max(0, -y)
+    sx1, sy1 = min(layer.width, out.width - x), min(layer.height, out.height - y)
+    if sx1 <= sx0 or sy1 <= sy0:
+        return out
+    if out.mode != "RGBA":
+        out = out.convert("RGBA")
+    out.alpha_composite(layer.crop((sx0, sy0, sx1, sy1)), (x + sx0, y + sy0))
+    return out
+
+
 def draw_objects(img, objects):
     """Copy of img with the annotation objects rendered on top, in order."""
     if not objects:
         return img
+    mode = img.mode
     out = img.copy()
     d = ImageDraw.Draw(out)
     for o in objects:
-        t, c, w = o["type"], o.get("color", "#ff0000"), int(o.get("width", 3))
+        t = o["type"]
+        ang = o.get("angle", 0) % 360
+        if ang and t in ROTATABLE:
+            if t in LINE_TYPES or t == "pen":
+                # vector shapes: rotate the geometry itself around the centre
+                l, tp, r, b = obj_bbox(unrotated(o))
+                cen = ((l + r) / 2, (tp + b) / 2)
+                o = unrotated(o)
+                if t == "pen":
+                    o["pts"] = [rotate_pt(p, cen, ang) for p in o["pts"]]
+                else:
+                    (o["x0"], o["y0"]) = rotate_pt((o["x0"], o["y0"]), cen, ang)
+                    (o["x1"], o["y1"]) = rotate_pt((o["x1"], o["y1"]), cen, ang)
+            else:
+                # raster shapes / text: draw unrotated on a transparent layer, rotate it, composite
+                o2 = unrotated(o)
+                l, tp, r, b = obj_bbox(o2)
+                pad = int(o.get("width", 3)) + 6
+                l, tp, r, b = int(l) - pad, int(tp) - pad, int(r) + pad + 1, int(b) + pad + 1
+                move_obj(o2, -l, -tp)
+                layer = draw_objects(Image.new("RGBA", (max(1, r - l), max(1, b - tp)), (0, 0, 0, 0)), [o2])
+                rot = layer.rotate(-ang, resample=Image.BICUBIC, expand=True)
+                out = paste_layer(out, rot, (l + r) / 2 - rot.width / 2, (tp + b) / 2 - rot.height / 2)
+                d = ImageDraw.Draw(out)
+                continue
+        c, w = o.get("color", "#ff0000"), int(o.get("width", 3))
         if t in BOX_TYPES:
             box = (min(o["x0"], o["x1"]), min(o["y0"], o["y1"]), max(o["x0"], o["x1"]), max(o["y0"], o["y1"]))
         if t == "rect":
-            d.rectangle(box, outline=c, width=w)
+            if o.get("dash") and not o.get("fill"):
+                bx0, by0, bx1, by1 = box
+                polyline(d, [(bx0, by0), (bx1, by0), (bx1, by1), (bx0, by1), (bx0, by0)], c, w, (w * 3, w * 2))
+            else:
+                d.rectangle(box, fill=c if o.get("fill") else None, outline=c, width=w)
+        elif t in ("star", "triangle", "diamond"):
+            pts = shape_points(t, box)
+            d.line(pts + [pts[0]], fill=c, width=w, joint="curve")
+            if o.get("fill"):
+                d.polygon(pts, fill=c)
         elif t == "rrect":
             d.rounded_rectangle(box, radius=max(4, min(24, (box[2] - box[0]) // 6, (box[3] - box[1]) // 6)),
-                                outline=c, width=w)
+                                fill=c if o.get("fill") else None, outline=c, width=w)
         elif t == "frect":
             b = clip_box(box, out.size)
             if b[2] - b[0] >= 1 and b[3] - b[1] >= 1:
                 region = out.crop(b).convert("RGBA")
                 ov = Image.new("RGBA", region.size, hex_rgb(c) + (int(o.get("alpha", 90)),))
-                out.paste(Image.alpha_composite(region, ov).convert("RGB"), b[:2])
+                out.paste(Image.alpha_composite(region, ov).convert(out.mode), b[:2])
                 d = ImageDraw.Draw(out)
             d.rectangle(box, outline=c, width=w)
         elif t == "spotlight":
@@ -817,16 +1049,28 @@ def draw_objects(img, objects):
             b = clip_box(box, out.size)
             if b[2] - b[0] >= 1 and b[3] - b[1] >= 1:
                 ImageDraw.Draw(dark).rectangle((b[0], b[1], b[2] - 1, b[3] - 1), fill=(0, 0, 0, 0))
-            out = Image.alpha_composite(out.convert("RGBA"), dark).convert("RGB")
+            out = Image.alpha_composite(out.convert("RGBA"), dark).convert(out.mode)
             d = ImageDraw.Draw(out)
         elif t == "pen":
-            if len(o["pts"]) > 1:
-                d.line(o["pts"], fill=c, width=w, joint="curve")
-            r = w / 2
-            for px, py in (o["pts"][0], o["pts"][-1]):
-                d.ellipse((px - r, py - r, px + r, py + r), fill=c)
+            polyline(d, o["pts"], c, w, (w * 3, w * 2) if o.get("dash") else None, o.get("midarrow"))
+            if not o.get("dash"):
+                r = w / 2
+                for px, py in (o["pts"][0], o["pts"][-1]):
+                    d.ellipse((px - r, py - r, px + r, py + r), fill=c)
         elif t == "ellipse":
-            d.ellipse(box, outline=c, width=w)
+            if o.get("dash") and not o.get("fill"):
+                polyline(d, ellipse_points(box), c, w, (w * 3, w * 2))
+            else:
+                d.ellipse(box, fill=c if o.get("fill") else None, outline=c, width=w)
+        elif t == "arc":
+            pts = arc_points(box, o.get("start", 0), o.get("end", 90))
+            polyline(d, pts, c, w, (w * 3, w * 2) if o.get("dash") else None)
+            if o.get("heads", True) and len(pts) > 2:
+                L = max(10, w * 3.5)
+                _head(d, pts[-1], math.atan2(pts[-1][1] - pts[-3][1], pts[-1][0] - pts[-3][0]), L, c)
+                _head(d, pts[0], math.atan2(pts[0][1] - pts[2][1], pts[0][0] - pts[2][0]), L, c)
+        elif t == "symbol":
+            draw_symbol(d, o.get("kind", "no"), box, c, w)
         elif t in ("highlight", "blur"):
             b = clip_box(box, out.size)
             if b[2] - b[0] < 1 or b[3] - b[1] < 1:
@@ -834,7 +1078,7 @@ def draw_objects(img, objects):
             region = out.crop(b)
             if t == "highlight":
                 ov = Image.new("RGBA", region.size, hex_rgb(c) + (110,))
-                region = Image.alpha_composite(region.convert("RGBA"), ov).convert("RGB")
+                region = Image.alpha_composite(region.convert("RGBA"), ov).convert(out.mode)
             else:
                 k = max(3, int(o.get("block", 8)))
                 small = region.resize((max(1, region.width // k), max(1, region.height // k)), Image.BILINEAR)
@@ -842,7 +1086,8 @@ def draw_objects(img, objects):
             out.paste(region, b[:2])
             d = ImageDraw.Draw(out)
         elif t in LINE_TYPES:
-            draw_arrow(d, (o["x0"], o["y0"]), (o["x1"], o["y1"]), c, w, t != "line", both=(t == "darrow"))
+            draw_arrow(d, (o["x0"], o["y0"]), (o["x1"], o["y1"]), c, w, t != "line", both=(t == "darrow"),
+                       dash=(w * 3, w * 2) if o.get("dash") else None, mid_arrows=o.get("midarrow"))
         elif t == "text":
             d.multiline_text((o["x0"], o["y0"]), wrapped_text(o), fill=c, font=get_font(o["size"]), spacing=4)
         elif t == "callout":
@@ -852,7 +1097,7 @@ def draw_objects(img, objects):
             r, (cx, cy) = step_radius(o), (o["x0"], o["y0"])
             d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=c, outline="white", width=2)
             d.text((cx, cy), str(o["n"]), fill="white", font=get_font(r * 1.1, True), anchor="mm")
-    return out
+    return out if out.mode == mode else out.convert(mode)
 
 
 # =========================================================================== #
@@ -1465,6 +1710,72 @@ class Recorder(threading.Thread):
 
     def stop(self):
         self.stop_flag.set()
+
+
+class RecordCountdown(tk.Toplevel):
+    """4..3..2..1 before a recording starts, with a chance to take a still screenshot instead or cancel."""
+
+    def __init__(self, master, bbox, on_go, on_screenshot, on_cancel, seconds=4):
+        super().__init__(master)
+        self.on_go, self.on_screenshot, self.on_cancel = on_go, on_screenshot, on_cancel
+        self.left, self.done = seconds, False
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.configure(bg="#1e1e1e", highlightthickness=1, highlightbackground="#555")
+        self.num = tk.Label(self, text=str(seconds), fg="#ff3b30", bg="#1e1e1e", font=("Segoe UI", 44, "bold"),
+                            padx=18)
+        self.num.pack(side="left")
+        col = tk.Frame(self, bg="#1e1e1e")
+        col.pack(side="left", padx=(0, 14), pady=10)
+        tk.Label(col, text="Recording starts in…", fg="white", bg="#1e1e1e", font=("Segoe UI", 11, "bold")
+                 ).pack(anchor="w")
+        row = tk.Frame(col, bg="#1e1e1e")
+        row.pack(anchor="w", pady=(6, 0))
+        for text, cmd, bg in (("📷  Screenshot instead", self.shot, "#0a64ff"), ("▶  Start now", self.go, "#2e7d32"),
+                              ("✕  Cancel", self.cancel, "#3a3a3a")):
+            b = tk.Label(row, text=text, bg=bg, fg="white", padx=10, pady=4, cursor="hand2", font=("Segoe UI", 10))
+            b.pack(side="left", padx=3)
+            b.bind("<Button-1>", lambda e, c=cmd: c())
+        tk.Label(col, text="S = screenshot   Enter = start   Esc = cancel", fg="#888", bg="#1e1e1e",
+                 font=("Segoe UI", 8)).pack(anchor="w", pady=(4, 0))
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        l, t, r, b = bbox
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        x = max(0, min((l + r) // 2 - w // 2, sw - w))
+        y = t - h - 8 if t - h - 8 >= 0 else (b + 8 if b + 8 + h <= sh else max(0, (t + b) // 2 - h // 2))
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.bind("<Escape>", lambda e: self.cancel())
+        self.bind("<Return>", lambda e: self.go())
+        self.bind("<KeyPress-s>", lambda e: self.shot())
+        self.after(30, self.focus_force)
+        self.after(1000, self.tick)
+
+    def tick(self):
+        if self.done:
+            return
+        self.left -= 1
+        if self.left <= 0:
+            self.go()
+            return
+        self.num.config(text=str(self.left))
+        self.after(1000, self.tick)
+
+    def _finish(self, cb):
+        if self.done:
+            return
+        self.done = True
+        self.destroy()
+        cb()
+
+    def go(self):
+        self._finish(self.on_go)
+
+    def shot(self):
+        self._finish(self.on_screenshot)
+
+    def cancel(self):
+        self._finish(self.on_cancel)
 
 
 class RecordBar(tk.Toplevel):
@@ -2173,23 +2484,30 @@ class HistoryPanel(ttk.Frame):
         for w in self.inner.winfo_children():
             w.destroy()
         self.thumbs.clear()
+        cache = getattr(self, "_thumb_cache", {})
         files = self.items()
         self.count_lbl.config(text=f"{len(files)} items in {LIBRARY_DIR}")
+        new_cache = {}
         for p in files:
             video = self.is_video(p)
             try:
-                src = Path(str(p) + ".jpg") if video else p
-                if video and not src.exists():
-                    im = Image.new("RGB", (160, self.THUMB_H), "#333")
-                else:
-                    im = Image.open(src)
-                    im.thumbnail((200, self.THUMB_H))
-                if video:
-                    d = ImageDraw.Draw(im, "RGBA")
-                    cx, cy = im.width // 2, im.height // 2
-                    d.ellipse((cx - 16, cy - 16, cx + 16, cy + 16), fill=(0, 0, 0, 150))
-                    d.polygon([(cx - 6, cy - 9), (cx - 6, cy + 9), (cx + 9, cy)], fill="white")
-                ph = ImageTk.PhotoImage(im)
+                key = (str(p), p.stat().st_mtime)
+                ph = cache.get(key)          # thumbnails are cached, so a refresh is instant
+                if ph is None:
+                    src = Path(str(p) + ".jpg") if video else p
+                    if video and not src.exists():
+                        im = Image.new("RGB", (160, self.THUMB_H), "#333")
+                    else:
+                        im = Image.open(src)
+                        im.draft("RGB", (400, 400))      # fast decode for big PNG/JPG
+                        im.thumbnail((200, self.THUMB_H))
+                    if video:
+                        d = ImageDraw.Draw(im, "RGBA")
+                        cx, cy = im.width // 2, im.height // 2
+                        d.ellipse((cx - 16, cy - 16, cx + 16, cy + 16), fill=(0, 0, 0, 150))
+                        d.polygon([(cx - 6, cy - 9), (cx - 6, cy + 9), (cx + 9, cy)], fill="white")
+                    ph = ImageTk.PhotoImage(im)
+                new_cache[key] = ph
             except Exception:
                 continue
             self.thumbs.append(ph)
@@ -2208,6 +2526,7 @@ class HistoryPanel(ttk.Frame):
                 w.bind("<MouseWheel>", self.wheel)
             Tooltip(lbl, f"{p.name}\n{'Click = trim / crop' if video else 'Click = open in editor'}  •  "
                          "Double-click = open with Windows  •  Right-click = more")
+        self._thumb_cache = new_cache
 
     def click(self, p, lbl):
         if self.selected is not None:
@@ -2255,7 +2574,7 @@ class HistoryPanel(ttk.Frame):
         try:
             im = Image.open(p)
             im.load()
-            copy_image_to_clipboard(im, self.winfo_toplevel().winfo_id())
+            copy_image_to_clipboard(im, self.winfo_toplevel().winfo_id(), p)
             self.winfo_toplevel().set_status(f"Copied {p.name} to the clipboard.")
         except Exception as ex:
             log.exception("history copy failed")
@@ -2294,6 +2613,9 @@ TOOLS = [
     ("rrect", "▢", "Round box", "r", "Drag to draw a rounded box."),
     ("frect", "▰", "Filled box", "f", "Drag to draw a semi-transparent filled box."),
     ("ellipse", "◯", "Ellipse", "o", "Drag to draw an ellipse."),
+    ("star", "★", "Star", "j", "Drag to draw a star (tick Filled in the bar to fill it)."),
+    ("triangle", "△", "Triangle", "y", "Drag to draw a triangle."),
+    ("diamond", "◇", "Diamond", "w", "Drag to draw a diamond."),
     ("arrow", "➜", "Arrow", "a", "Drag to draw an arrow."),
     ("darrow", "⟷", "2-way arrow", "d", "Drag to draw an arrow with heads at both ends."),
     ("line", "╱", "Line", "l", "Drag to draw a line."),
@@ -2305,12 +2627,15 @@ TOOLS = [
     ("callout", "❝", "Callout", "k", "Click to add a text box with a border."),
     ("step", "①", "Step", "n", "Click to add the next step number (1, 2, 3…)."),
     None,
+    ("arc", "◠", "Angle arc", "q", "Drag a box – an arc with arrowheads is drawn in it.\nSet start / end angle in the bar; tick Dashed for reference arcs."),
+    ("symbol", "☉", "Symbol", "x", "Click to place a help-image symbol: probe, ruby probe, stopwatch,\nthermometer, 'no' sign, ±, rotation…"),
+    None,
     ("pick", "◉", "Pick fill", "i", "Click a pixel to use its colour for Erase / Move fill."),
 ]
 TOOL_LIST = [t for t in TOOLS if t]
-OBJECT_DRAG_TOOLS = ("rect", "rrect", "frect", "ellipse", "arrow", "darrow", "line", "pen", "highlight",
-                     "spotlight", "blur")
-OBJECT_CLICK_TOOLS = ("text", "callout", "step")
+OBJECT_DRAG_TOOLS = ("rect", "rrect", "frect", "ellipse", "star", "triangle", "diamond", "arc", "arrow", "darrow",
+                     "line", "pen", "highlight", "spotlight", "blur")
+OBJECT_CLICK_TOOLS = ("text", "callout", "step", "symbol")
 ANNOTATION_TOOLS = OBJECT_DRAG_TOOLS + OBJECT_CLICK_TOOLS
 
 
@@ -2368,6 +2693,8 @@ class SnapPatch(tk.Tk):
         self.settings = load_settings()
         self.rec_fps = tk.IntVar(value=int(self.settings.get("rec_fps", 12)))
         self.rec_cursor = tk.BooleanVar(value=True)
+        self.draw_dashed = tk.BooleanVar(value=False)      # new lines / shapes dashed?
+        self.draw_midarrow = tk.BooleanVar(value=False)    # arrowheads along the path?
 
         self.report_callback_exception = self.on_tk_error
         log.info("Start %s %s: Python %s, Pillow %s, numpy %s, %s", APP_NAME, APP_VERSION, sys.version.split()[0],
@@ -2443,6 +2770,7 @@ class SnapPatch(tk.Tk):
         f.add_checkbutton(label="Start SnapPatch with Windows (minimized, hotkeys ready)", variable=self.startup_var,
                           command=self.toggle_startup)
         f.add_separator()
+        f.add_command(label="New blank worksheet…", accelerator="Ctrl+Shift+N", command=self.new_blank_canvas)
         f.add_command(label="Open…", accelerator="Ctrl+O", command=self.open_dialog)
         f.add_command(label="Paste as new image", accelerator="Ctrl+Shift+V", command=self.paste_as_new)
         f.add_separator()
@@ -2485,6 +2813,30 @@ class SnapPatch(tk.Tk):
         v.add_checkbutton(label="History strip", variable=self.show_library, command=self.toggle_library)
         mb.add_cascade(label="View", menu=v)
 
+        hm = tk.Menu(mb, tearoff=False)
+        nm = tk.Menu(hm, tearoff=False)
+        for name in HELP_PRESETS:
+            nm.add_command(label=name, command=lambda n=name: self.new_help_canvas(n))
+        hm.add_cascade(label="New help image (green canvas)", menu=nm)
+        hm.add_command(label="Insert CIM3D screenshot from clipboard as layer", accelerator="Ctrl+V",
+                       command=self.paste_layer)
+        hm.add_command(label="Insert image file as layer…", command=self.insert_image)
+        hm.add_separator()
+        hm.add_command(label="Replace background with guideline green (click a background pixel)",
+                       command=self.start_replace_background)
+        fm2 = tk.Menu(hm, tearoff=False)
+        for name in HELP_PRESETS:
+            fm2.add_command(label=name, command=lambda n=name: self.fit_to_help_preset(n))
+        hm.add_cascade(label="Fit current image onto a help canvas", menu=fm2)
+        hm.add_separator()
+        hm.add_command(label="Check against guidelines", command=lambda: self.check_help_guidelines(show=True))
+        hm.add_command(label="Export help image…", accelerator="Ctrl+Shift+E", command=self.export_help_image)
+        hm.add_separator()
+        hm.add_command(label="Open the Help Image Design Guide (Confluence)",
+                       command=lambda: os.startfile("https://ancagroup.atlassian.net/wiki/spaces/TRKB/pages/"
+                                                    "8851496898/Help+Image+Design+Guide") if IS_WIN else None)
+        mb.add_cascade(label="Help image", menu=hm)
+
         h = tk.Menu(mb, tearoff=False)
         h.add_command(label="Hotkeys…", command=self.show_hotkeys)
         h.add_command(label="Diagnostics…", command=self.show_diagnostics)
@@ -2517,10 +2869,13 @@ class SnapPatch(tk.Tk):
         rec.pack(side="left", padx=(0, 12))
         self.rec_btn = rec
         Tooltip(rec, f"Record a video of part of the screen ({RECORD_HOTKEY_TEXT} starts and stops)")
-        for text, cmd, tip in [("Open", self.open_dialog, "Open an image or project (Ctrl+O)"),
-                               ("Save", self.save, "Save (Ctrl+S)"),
-                               ("Copy", self.copy, "Copy to clipboard (Ctrl+C)")]:
-            b = ttk.Button(top, text=text, command=cmd, width=7)
+        for text, cmd, tip, wd in [("▦ New", self.new_blank_canvas, "New blank worksheet to arrange images on", 7),
+                                   ("📂 Open", self.open_dialog, "Open an image or project (Ctrl+O)", 8),
+                                   ("💾 Save", self.save, "Save (Ctrl+S)", 8),
+                                   ("💾 Save as", self.save_as, "Save as – choose format, size, quality (Ctrl+Shift+S)", 10),
+                                   ("📤 Export", self.export_help_image, "Export as ToolRoom help image (Ctrl+Shift+E)", 9),
+                                   ("📋 Copy", self.copy, "Copy to clipboard – pastes into Office, Teams or a folder (Ctrl+C)", 8)]:
+            b = ttk.Button(top, text=text, command=cmd, width=wd)
             b.pack(side="left", padx=1)
             Tooltip(b, tip)
         ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=10)
@@ -2679,6 +3034,248 @@ class SnapPatch(tk.Tk):
             log.exception("startup toggle failed")
             messagebox.showerror(APP_NAME, f"Could not change the start-up setting:\n{ex}", parent=self)
 
+    # --- ToolRoom help images ---------------------------------------------------------
+    def new_help_canvas(self, preset):
+        w, h, fmt = HELP_PRESETS[preset]
+        if self.img is not None and self.dirty:
+            if not messagebox.askyesno(APP_NAME, "Discard the current image and start a new help canvas?", parent=self):
+                return
+        self.load_image(Image.new("RGB", (w, h), HELP_BG))
+        self.help_preset = preset
+        self.set_ann_color(HELP_COLOURS[0][1])
+        self.line_width.set(2)
+        self.font_size.set(14)
+        self.tool.set("arrow")
+        self.zoom_100()
+        self.schedule_context()
+        self.set_status(f"Help canvas {w} × {h} (green). Paste the CIM3D view as a layer (Ctrl+V), "
+                        "then draw with the guideline colours. Ctrl+Shift+E exports.")
+
+    def match_help_background(self, piece, tol=40):
+        """A CIM3D screenshot pasted onto a help canvas: turn its own background (the most common colour
+        along its border – CIM3D's grey or its slightly different green) into the exact guideline green,
+        so the pasted rectangle disappears into the canvas."""
+        if np is None:
+            return piece
+        rgb = piece.convert("RGB")
+        a = np.asarray(rgb).astype(np.int16)
+        border = np.concatenate([a[0], a[-1], a[:, 0], a[:, -1]])
+        cols, counts = np.unique(border, axis=0, return_counts=True)
+        ref = cols[counts.argmax()]
+        if counts.max() < 0.3 * len(border):          # no dominant background colour – leave it alone
+            return piece
+        if tuple(int(v) for v in ref) == HELP_BG:
+            return piece
+        mask = np.abs(a - ref).max(axis=2) <= tol
+        a[mask] = HELP_BG
+        out = Image.fromarray(a.astype(np.uint8), "RGB")
+        if piece.mode == "RGBA":
+            out.putalpha(piece.split()[3])
+        self.set_status(f"Pasted image: background RGB{tuple(int(v) for v in ref)} changed to the guideline green "
+                        f"({int(mask.sum()):,} px). Undo with Ctrl+Z if that was wrong.")
+        return out
+
+    def new_blank_canvas(self):
+        """A plain worksheet (white / grey / green / custom) to arrange several captures on."""
+        if self.img is not None and self.dirty and not messagebox.askyesno(
+                APP_NAME, "Discard the current image and start a new worksheet?", parent=self):
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title("New worksheet")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        f = ttk.Frame(dlg, padding=14)
+        f.pack()
+        ttk.Label(f, text="Size").grid(row=0, column=0, sticky="w", pady=4)
+        sizes = ["1920 × 1080  (Full HD)", "1600 × 900", "1280 × 720", "1024 × 768", "800 × 600", "A4 landscape 1754 × 1240",
+                 "A4 portrait 1240 × 1754", "Custom"]
+        sv = tk.StringVar(value=self.settings.get("ws_size", sizes[0]))
+        ttk.Combobox(f, values=sizes, textvariable=sv, width=28, state="readonly").grid(row=0, column=1, sticky="w")
+        ttk.Label(f, text="Custom W × H").grid(row=1, column=0, sticky="w", pady=4)
+        cw, ch = tk.StringVar(value="1400"), tk.StringVar(value="900")
+        cf = ttk.Frame(f)
+        cf.grid(row=1, column=1, sticky="w")
+        ttk.Entry(cf, textvariable=cw, width=6).pack(side="left")
+        ttk.Label(cf, text=" × ").pack(side="left")
+        ttk.Entry(cf, textvariable=ch, width=6).pack(side="left")
+        ttk.Label(f, text="Background").grid(row=2, column=0, sticky="w", pady=4)
+        bgs = {"White": "#ffffff", "Light grey": "#f0f0f0", "Dark": "#2b2b2b", "Help-image green": "#004b2c"}
+        bv = tk.StringVar(value=self.settings.get("ws_bg", "White"))
+        ttk.Combobox(f, values=list(bgs), textvariable=bv, width=28, state="readonly").grid(row=2, column=1, sticky="w")
+        result = {}
+
+        def ok():
+            try:
+                if sv.get() == "Custom":
+                    w, h = int(cw.get()), int(ch.get())
+                else:
+                    nums = [int(s) for s in sv.get().replace("×", " ").split() if s.isdigit()]
+                    w, h = nums[-2], nums[-1]
+                if not (16 <= w <= 20000 and 16 <= h <= 20000):
+                    raise ValueError
+            except (ValueError, IndexError):
+                messagebox.showerror(APP_NAME, "Please enter a width and height between 16 and 20000.", parent=dlg)
+                return
+            result.update(w=w, h=h, bg=bgs[bv.get()])
+            self.settings.update(ws_size=sv.get(), ws_bg=bv.get())
+            save_settings(self.settings)
+            dlg.destroy()
+
+        bf = ttk.Frame(f)
+        bf.grid(row=3, column=0, columnspan=2, pady=(12, 0), sticky="e")
+        ttk.Button(bf, text="Create", style="Accent.TButton", command=ok).pack(side="left", padx=4)
+        ttk.Button(bf, text="Cancel", command=dlg.destroy).pack(side="left", padx=4)
+        dlg.bind("<Return>", lambda e: ok())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.geometry(f"+{self.winfo_rootx() + 200}+{self.winfo_rooty() + 150}")
+        dlg.grab_set()
+        self.wait_window(dlg)
+        if not result:
+            return
+        self.load_image(Image.new("RGB", (result["w"], result["h"]), result["bg"]))
+        self.tool.set("select")
+        self.set_status("Blank worksheet. Ctrl+V pastes captures as layers; drag them around, resize with corners, "
+                        "Enter to apply. Right-click a History thumbnail → 'Paste into current image as layer' also works.")
+
+    def choose_symbol_dir(self):
+        p = filedialog.askdirectory(parent=self, title="Folder with symbol images (PNG / BMP)")
+        if p:
+            self.settings["symbol_dir"] = p
+            save_settings(self.settings)
+            self.set_status(f"Symbol folder set: {p} – the Symbol tool now lists its images.")
+
+    def insert_symbol_file(self, path, x, y):
+        try:
+            im = Image.open(path)
+            im.load()
+        except Exception as ex:
+            messagebox.showerror(APP_NAME, f"Could not open {path}:\n{ex}", parent=self)
+            return
+        im = im.convert("RGBA") if im.mode in ("RGBA", "LA", "P") else im.convert("RGB")
+        self.sel = (x - im.width // 2, y - im.height // 2, x + im.width // 2, y + im.height // 2)
+        self.add_layer(im)
+
+    def start_replace_background(self):
+        if not self.need_img():
+            return
+        self.pending_pick = "helpbg"
+        self.set_status("Click a pixel of the background you want replaced with the guideline green.")
+
+    def replace_background(self, x, y, tol=38):
+        """Replace every pixel similar to the clicked one with the guideline green (CIM3D grey -> green)."""
+        if np is None:
+            messagebox.showerror(APP_NAME, "numpy is needed for this.", parent=self)
+            return
+        if not (0 <= x < self.img.width and 0 <= y < self.img.height):
+            return
+        self.commit_float()
+        self.push_undo()
+        a = np.asarray(self.img).astype(np.int16)
+        ref = a[y, x]
+        mask = np.abs(a - ref).max(axis=2) <= tol
+        a[mask] = HELP_BG
+        self.img = Image.fromarray(a.astype(np.uint8), "RGB")
+        self.render()
+        self.set_status(f"Replaced {int(mask.sum()):,} background pixels with green (undo with Ctrl+Z).")
+
+    def fit_to_help_preset(self, preset):
+        """Scale the whole image (and its annotations) to fit a help canvas, centred on green."""
+        if not self.need_img():
+            return
+        w, h, fmt = HELP_PRESETS[preset]
+        self.commit_float()
+        self.push_undo()
+        iw, ih = self.img.size
+        f = min(w / iw, h / ih)
+        nw, nh = max(1, round(iw * f)), max(1, round(ih * f))
+        canvas = Image.new("RGB", (w, h), HELP_BG)
+        ox, oy = (w - nw) // 2, (h - nh) // 2
+        canvas.paste(self.img.resize((nw, nh), Image.LANCZOS), (ox, oy))
+        self.img = canvas
+        for o in self.objects:
+            if o["type"] == "pen":
+                o["pts"] = [(px * f + ox, py * f + oy) for px, py in o["pts"]]
+            else:
+                for k in ("x0", "x1"):
+                    if k in o:
+                        o[k] = o[k] * f + ox
+                for k in ("y0", "y1"):
+                    if k in o:
+                        o[k] = o[k] * f + oy
+            for k in ("width", "size", "w"):
+                if o.get(k):
+                    o[k] = max(1, int(round(o[k] * f)))
+        self.help_preset = preset
+        self.sel = None
+        self.zoom_100()
+        self.schedule_context()
+        self.set_status(f"Fitted onto {w} × {h} help canvas (scale {f:.2f}).")
+
+    def check_help_guidelines(self, show=False):
+        """Return a list of guideline problems with the current image (empty = fine)."""
+        if self.img is None:
+            return ["No image."]
+        preset = getattr(self, "help_preset", None) or list(HELP_PRESETS)[0]
+        w, h, fmt = HELP_PRESETS[preset]
+        issues = []
+        if self.img.size != (w, h):
+            issues.append(f"Size is {self.img.width} × {self.img.height}; the guideline is {w} × {h} "
+                          f"(Help image → Fit current image onto a help canvas).")
+        allowed = {c.lower() for _, c in HELP_COLOURS}
+        for o in self.objects:
+            t = o["type"]
+            if t in ("text", "callout"):
+                if any(ch not in HELP_TEXT_OK for ch in o.get("text", "")):
+                    issues.append(f"Text '{o['text'][:30]}' – help images must not contain words "
+                                  "(numbers and +/- are fine) so they work in every language.")
+            elif t == "step":
+                issues.append("Step numbers are text-like; guideline images use arrows and symbols only.")
+            if t in ("arrow", "darrow", "line", "pen", "rect", "rrect", "ellipse", "star", "triangle", "diamond") \
+                    and o.get("color", "").lower() not in allowed:
+                issues.append(f"{t} drawn in {o.get('color')} – guideline colours are orange (arrows/dimensions), "
+                              "purple (reference lines) and black (axes).")
+        if np is not None:
+            a = np.asarray(self.img)
+            edge = np.concatenate([a[0], a[-1], a[:, 0], a[:, -1]])
+            if (np.abs(edge.astype(np.int16) - np.array(HELP_BG)).max(axis=1) > 30).mean() > 0.5:
+                issues.append("Background around the edge is not the guideline green RGB(0,75,44) "
+                              "(Help image → Replace background).")
+        if show:
+            messagebox.showinfo(APP_NAME, "Meets the ToolRoom help-image guidelines." if not issues else
+                                "Guideline check:\n\n• " + "\n• ".join(issues), parent=self)
+        return issues
+
+    def export_help_image(self):
+        if not self.need_img():
+            return
+        issues = self.check_help_guidelines()
+        if issues and not messagebox.askyesno(APP_NAME, "Guideline check:\n\n• " + "\n• ".join(issues) +
+                                              "\n\nExport anyway?", parent=self):
+            return
+        preset = getattr(self, "help_preset", None) or list(HELP_PRESETS)[0]
+        w, h, fmt = HELP_PRESETS[preset]
+        out = self.flattened()
+        if out.size != (w, h):
+            f = min(w / out.width, h / out.height)
+            scaled = out.resize((max(1, round(out.width * f)), max(1, round(out.height * f))), Image.LANCZOS)
+            canvas = Image.new("RGB", (w, h), HELP_BG)
+            canvas.paste(scaled, ((w - scaled.width) // 2, (h - scaled.height) // 2))
+            out = canvas
+        base = Path(self.path).stem if self.path else "help_image"
+        p = filedialog.asksaveasfilename(parent=self, defaultextension="." + fmt, initialfile=f"{base}.{fmt}",
+                                         filetypes=[("PNG", "*.png")] if fmt == "png" else [("JPEG", "*.jpg")])
+        if not p:
+            return
+        try:
+            if fmt == "jpg":
+                out.save(p, quality=92)
+            else:
+                out.save(p, optimize=True)
+        except Exception as ex:
+            messagebox.showerror(APP_NAME, f"Could not save:\n{ex}", parent=self)
+            return
+        self.set_status(f"Help image exported: {p}  ({w} × {h} {fmt.upper()})")
+
     def show_diagnostics(self):
         lines = [f"{APP_NAME} {APP_VERSION}  –  {os.path.abspath(sys.argv[0])}",
                  f"Python: {sys.version.split()[0]}  ({sys.executable})",
@@ -2731,6 +3328,10 @@ class SnapPatch(tk.Tk):
         k("<Delete>", lambda e: None if self.typing(e) else self.delete_key())
         k("<Return>", lambda e: None if self.typing(e) else self.commit_float())
         k("<Escape>", lambda e: self.escape())
+        k("<Control-E>", lambda e: self.export_help_image())
+        k("<Control-N>", lambda e: self.new_blank_canvas())
+        k("<Control-bracketleft>", lambda e: self.rotate_selected(-5))
+        k("<Control-bracketright>", lambda e: self.rotate_selected(5))
         for key, dx, dy in [("Left", -1, 0), ("Right", 1, 0), ("Up", 0, -1), ("Down", 0, 1)]:
             k(f"<{key}>", lambda e, dx=dx, dy=dy: None if self.typing(e) else self.nudge(dx, dy))
             k(f"<Shift-{key}>", lambda e, dx=dx, dy=dy: None if self.typing(e) else self.nudge(dx * 10, dy * 10))
@@ -2780,20 +3381,45 @@ class SnapPatch(tk.Tk):
                                          command=self.choose_fill_color, cursor="hand2")
             self.fill_swatch.pack(side="left")
 
+        if getattr(self, "help_preset", None):
+            # guideline colour strip – always visible while working on a help image
+            w, h, fmt = HELP_PRESETS[self.help_preset]
+            ttk.Label(c, text=f"Help image {w}×{h}:", style="Ctx.TLabel",
+                      font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 4))
+            for name, col in HELP_COLOURS:
+                b = tk.Button(c, text=name, bg=col, fg="white", activebackground=col, relief="flat", bd=0,
+                              padx=6, cursor="hand2", font=("Segoe UI", 8), command=lambda col=col: self.set_ann_color(col))
+                b.pack(side="left", padx=1)
+            ttk.Button(c, text="Check", width=6, command=lambda: self.check_help_guidelines(show=True)).pack(side="left", padx=(6, 0))
+            ttk.Button(c, text="Export", width=7, command=self.export_help_image).pack(side="left", padx=2)
+            ttk.Separator(c, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        def rotate_controls(get_angle, set_angle):
+            ttk.Label(c, text="Rotate", style="Ctx.TLabel").pack(side="left", padx=(12, 2))
+            ttk.Button(c, text="↺", width=3, command=lambda: set_angle(get_angle() - 15)).pack(side="left")
+            var = tk.StringVar(value=str(int(get_angle())))
+            sp = ttk.Spinbox(c, from_=-180, to=360, increment=5, width=5, textvariable=var,
+                             command=lambda: self._spin_angle(var, set_angle))
+            sp.pack(side="left", padx=2)
+            sp.bind("<Return>", lambda e: self._spin_angle(var, set_angle))
+            ttk.Button(c, text="↻", width=3, command=lambda: set_angle(get_angle() + 15)).pack(side="left")
+            ttk.Label(c, text="°", style="Ctx.TLabel").pack(side="left", padx=(0, 6))
+
         t = self.tool.get()
         if self.float:
-            fw, fh = self.float["img"].size
+            fw, fh = self.float["size"]
             ow, oh = self.float["orig"].size
             lbl(f"Pasted piece {fw} × {fh}:", True)
-            lbl("drag to move • corner handles to resize (Shift = free) • arrows nudge")
+            lbl("drag to move • corners resize (Shift = free) • Ctrl+[ ] rotate")
             ttk.Label(c, text="Scale %", style="Ctx.TLabel").pack(side="left", padx=(6, 4))
             self.float_scale = tk.StringVar(value=str(round(fw / ow * 100)))
             sp = ttk.Spinbox(c, from_=5, to=800, width=5, textvariable=self.float_scale,
                              command=self.apply_float_scale)
             sp.pack(side="left")
             sp.bind("<Return>", lambda e: self.apply_float_scale())
-            if (fw, fh) != (ow, oh):
-                btn("Original size", self.reset_float_size)
+            rotate_controls(lambda: self.float["angle"], lambda a: self.rotate_float(absolute=a))
+            if (fw, fh) != (ow, oh) or self.float["angle"] % 360:
+                btn("Reset size / angle", self.reset_float_size)
             btn("✔ Apply  (Enter)", self.commit_float)
             btn("✖ Cancel  (Esc)", self.cancel_float)
         elif self.sel_obj is not None:
@@ -2805,6 +3431,39 @@ class SnapPatch(tk.Tk):
                 spin("Width", self.line_width, 1, 30)
             if "size" in o:
                 spin("Size", self.font_size, 6, 120)
+            if o["type"] in ROTATABLE:
+                rotate_controls(lambda: o.get("angle", 0), lambda a: self.rotate_object(absolute=a))
+            if o["type"] in ("star", "triangle", "diamond", "ellipse", "rect", "rrect"):
+                fv = tk.BooleanVar(value=bool(o.get("fill")))
+                ttk.Checkbutton(c, text="Filled", variable=fv, style="Ctx.TCheckbutton",
+                                command=lambda: self.set_obj_prop("fill", fv.get())).pack(side="left", padx=(8, 0))
+            if o["type"] in DASHABLE:
+                dv = tk.BooleanVar(value=bool(o.get("dash")))
+                ttk.Checkbutton(c, text="Dashed", variable=dv, style="Ctx.TCheckbutton",
+                                command=lambda: self.set_obj_prop("dash", dv.get())).pack(side="left", padx=(8, 0))
+            if o["type"] in ("line", "arrow", "darrow", "pen"):
+                mv = tk.BooleanVar(value=bool(o.get("midarrow")))
+                ttk.Checkbutton(c, text="Arrows along path", variable=mv, style="Ctx.TCheckbutton",
+                                command=lambda: self.set_obj_prop("midarrow", mv.get())).pack(side="left", padx=(8, 0))
+            if o["type"] == "arc":
+                for key, label in (("start", "Start °"), ("end", "End °")):
+                    ttk.Label(c, text=label, style="Ctx.TLabel").pack(side="left", padx=(8, 2))
+                    av = tk.StringVar(value=str(int(o.get(key, 0 if key == "start" else 90))))
+                    sb = ttk.Spinbox(c, from_=-360, to=720, increment=5, width=5, textvariable=av,
+                                     command=lambda k=key, v=av: self._set_num_prop(k, v))
+                    sb.pack(side="left")
+                    sb.bind("<Return>", lambda e, k=key, v=av: self._set_num_prop(k, v))
+                hv = tk.BooleanVar(value=bool(o.get("heads", True)))
+                ttk.Checkbutton(c, text="Arrowheads", variable=hv, style="Ctx.TCheckbutton",
+                                command=lambda: self.set_obj_prop("heads", hv.get())).pack(side="left", padx=(8, 0))
+            if o["type"] == "symbol":
+                ttk.Label(c, text="Symbol", style="Ctx.TLabel").pack(side="left", padx=(8, 2))
+                names = [n for _, n in SYMBOLS]
+                sv = tk.StringVar(value=dict(SYMBOLS).get(o.get("kind"), names[0]))
+                cb = ttk.Combobox(c, values=names, textvariable=sv, width=26, state="readonly")
+                cb.pack(side="left")
+                cb.bind("<<ComboboxSelected>>", lambda e: self.set_obj_prop(
+                    "kind", next(k for k, n in SYMBOLS if n == sv.get())))
             ttk.Frame(c, width=16, style="Ctx.TFrame").pack(side="left")
             if o["type"] in ("text", "callout"):
                 btn("Edit text", lambda: self.edit_text(o))
@@ -2824,8 +3483,15 @@ class SnapPatch(tk.Tk):
         elif t in ANNOTATION_TOOLS:
             if t not in ("highlight", "blur", "spotlight"):
                 colours()
-            if t in ("rect", "rrect", "frect", "ellipse", "arrow", "darrow", "line", "pen", "callout"):
+            if t in ("rect", "rrect", "frect", "ellipse", "star", "triangle", "diamond", "arc", "arrow", "darrow",
+                     "line", "pen", "callout"):
                 spin("Width", self.line_width, 1, 30)
+            if t in DASHABLE:
+                ttk.Checkbutton(c, text="Dashed", variable=self.draw_dashed, style="Ctx.TCheckbutton"
+                                ).pack(side="left", padx=(8, 0))
+            if t in ("line", "arrow", "darrow", "pen"):
+                ttk.Checkbutton(c, text="Arrows along path", variable=self.draw_midarrow,
+                                style="Ctx.TCheckbutton").pack(side="left", padx=(8, 0))
             if t in ("text", "callout", "step"):
                 spin("Size", self.font_size, 6, 120)
             lbl("    " + next(tip for k, _, _, _, tip in TOOL_LIST if k == t).split("\n")[0])
@@ -2912,7 +3578,28 @@ class SnapPatch(tk.Tk):
         return f["x"], f["y"], f["x"] + f["img"].width, f["y"] + f["img"].height
 
     def set_float(self, piece, x, y):
-        self.float = {"img": piece, "orig": piece.copy(), "x": int(x), "y": int(y)}
+        self.float = {"img": piece, "orig": piece.copy(), "size": piece.size, "angle": 0, "x": int(x), "y": int(y)}
+
+    def rebuild_float(self, final=False):
+        """Recreate the floating piece from the original + size + angle, keeping its centre in place."""
+        f = self.float
+        cx = f["x"] + f["img"].width / 2
+        cy = f["y"] + f["img"].height / 2
+        img = f["orig"]
+        if f["size"] != img.size:
+            img = img.resize(f["size"], Image.LANCZOS if final else Image.BILINEAR)
+        if f["angle"] % 360:
+            img = img.convert("RGBA").rotate(-f["angle"], resample=Image.BICUBIC, expand=True)
+        f["img"] = img
+        f["x"], f["y"] = int(round(cx - img.width / 2)), int(round(cy - img.height / 2))
+
+    def rotate_float(self, delta=None, absolute=None):
+        if not self.float:
+            return
+        self.float["angle"] = (absolute if absolute is not None else self.float["angle"] + delta) % 360
+        self.rebuild_float(final=True)
+        self.render()
+        self.schedule_context()
 
     def float_handles(self):
         x0, y0, x1, y1 = self.float_box()
@@ -2932,9 +3619,13 @@ class SnapPatch(tk.Tk):
     def resize_float(self, w, h, final=False):
         f = self.float
         w, h = max(4, int(w)), max(4, int(h))
-        if (w, h) == f["img"].size:
+        if (w, h) == f["size"] and not final:
             return
-        f["img"] = f["orig"].resize((w, h), Image.LANCZOS if final else Image.BILINEAR)
+        f["size"] = (w, h)
+        if f["angle"] % 360:
+            self.rebuild_float(final)
+        else:
+            f["img"] = f["orig"].resize((w, h), Image.LANCZOS if final else Image.BILINEAR)
 
     def apply_float_scale(self):
         if not self.float:
@@ -2949,7 +3640,9 @@ class SnapPatch(tk.Tk):
 
     def reset_float_size(self):
         if self.float:
-            self.float["img"] = self.float["orig"].copy()
+            self.float["size"] = self.float["orig"].size
+            self.float["angle"] = 0
+            self.rebuild_float(final=True)
             self.render()
             self.schedule_context()
 
@@ -3058,7 +3751,7 @@ class SnapPatch(tk.Tk):
             return
         self.cv.delete("ph")
         if fast and self._drag_base is not None:
-            if self.drag_mode in ("float", "float_resize") and self.float:
+            if self.drag_mode in ("float", "float_resize", "rotate_float") and self.float:
                 flat = self._drag_base.copy()
                 f = self.float["img"]
                 flat.paste(f, (self.float["x"], self.float["y"]), f if f.mode == "RGBA" else None)
@@ -3130,6 +3823,37 @@ class SnapPatch(tk.Tk):
         self.cv.yview(*a)
         self.schedule_blit()
 
+    ROT_HANDLE_DIST = 26     # screen px above the selection box
+
+    def rotate_handle_pos(self, target):
+        """Image coordinates of the rotate handle for 'float' or 'obj' (None if not applicable)."""
+        if target == "float":
+            if not self.float:
+                return None
+            l, t, r, b = self.float_box()
+        else:
+            if self.sel_obj is None or self.sel_obj["type"] not in ROTATABLE:
+                return None
+            l, t, r, b = obj_bbox(self.sel_obj)
+        return (l + r) / 2, t - self.ROT_HANDLE_DIST / self.zoom
+
+    def hit_rotate_handle(self, x, y):
+        tol = max(6, 10 / self.zoom)
+        for target in ("float", "obj"):
+            p = self.rotate_handle_pos(target)
+            if p is not None and abs(p[0] - x) <= tol and abs(p[1] - y) <= tol:
+                return target
+        return None
+
+    def draw_rotate_handle(self, target, colour, tag):
+        p = self.rotate_handle_pos(target)
+        if p is None:
+            return
+        hx, hy = self.cxy(*p)
+        self.cv.create_line(hx, hy + 7, hx, hy + self.ROT_HANDLE_DIST - 4, fill=colour, tags=tag)
+        self.cv.create_oval(hx - 7, hy - 7, hx + 7, hy + 7, fill="white", outline=colour, width=2, tags=tag)
+        self.cv.create_text(hx, hy, text="↻", fill=colour, font=("Segoe UI", 9, "bold"), tags=tag)
+
     def draw_overlays(self):
         self.cv.delete("sel", "flt", "objsel")
         if self.sel:
@@ -3149,8 +3873,11 @@ class SnapPatch(tk.Tk):
             fw, fh = self.float["img"].size
             ow, oh = self.float["orig"].size
             pct = f"  ({round(fw / ow * 100)}%)" if (fw, fh) != (ow, oh) else ""
-            self.cv.create_text(x0 + 4, y0 - 8, anchor="sw", fill="white", font=("Segoe UI", 9, "bold"), tags="flt",
-                                text=f"{fw} × {fh}{pct}   drag = move • corners = resize • Enter = apply")
+            ang = f"  {self.float['angle']:.0f}°" if self.float["angle"] % 360 else ""
+            self.cv.create_text(x1 + 6, y0, anchor="nw", fill="white", font=("Segoe UI", 9, "bold"), tags="flt",
+                                text=f"{fw} × {fh}{pct}{ang}\ndrag = move\ncorners = resize\n↻ handle = rotate\n"
+                                     "Enter = apply")
+            self.draw_rotate_handle("float", "#ff8c00", "flt")
         if self.sel_obj is not None:
             l, t, r, b = obj_bbox(self.sel_obj)
             l, t = self.cxy(l, t)
@@ -3160,6 +3887,10 @@ class SnapPatch(tk.Tk):
                 hx, hy = self.cxy(hx, hy)
                 self.cv.create_rectangle(hx - 5, hy - 5, hx + 5, hy + 5, fill="white", outline=ACCENT, width=2,
                                          tags="objsel")
+            self.draw_rotate_handle("obj", ACCENT, "objsel")
+            if self.sel_obj.get("angle", 0) % 360:
+                self.cv.create_text(r + 6, t, anchor="nw", fill="white", font=("Segoe UI", 9, "bold"),
+                                    tags="objsel", text=f"{self.sel_obj['angle']:.0f}°")
 
     def update_info(self, pos=None):
         if self.img is None:
@@ -3236,7 +3967,9 @@ class SnapPatch(tk.Tk):
         self.update_info((x, y))
         # cursor feedback
         cur = None
-        if self.float and self.hit_float_handle(x, y) is not None:
+        if self.hit_rotate_handle(x, y) is not None:
+            cur = "exchange"
+        elif self.float and self.hit_float_handle(x, y) is not None:
             cur = ("size_nw_se", "size_ne_sw", "size_ne_sw", "size_nw_se")[self.hit_float_handle(x, y)]
         elif self.float and inside(self.float_box(), x, y):
             cur = "fleur"
@@ -3299,7 +4032,7 @@ class SnapPatch(tk.Tk):
             self.schedule_context()
 
     def start_fast_drag(self):
-        if self.drag_mode in ("float", "float_resize"):
+        if self.drag_mode in ("float", "float_resize", "rotate_float"):
             self._drag_base = self.img
         elif self.sel_obj is not None:
             self._drag_base = draw_objects(self.composite(), [o for o in self.objects if o is not self.sel_obj])
@@ -3314,6 +4047,26 @@ class SnapPatch(tk.Tk):
         self.drag_pushed = False
         t = self.tool.get()
 
+        if getattr(self, "pending_pick", None) == "helpbg":
+            self.pending_pick = None
+            self.replace_background(x, y)
+            return
+        rt = self.hit_rotate_handle(x, y)
+        if rt is not None:
+            # rotate by dragging: remember where the drag started relative to the object's centre
+            if rt == "float":
+                l, tp, r, b = self.float_box()
+                base = self.float["angle"]
+            else:
+                l, tp, r, b = obj_bbox(self.sel_obj)
+                base = self.sel_obj.get("angle", 0)
+                self.push_undo()
+                self.drag_pushed = True
+            self.rot_centre = ((l + r) / 2, (tp + b) / 2)
+            self.rot_start = math.degrees(math.atan2(y - self.rot_centre[1], x - self.rot_centre[0])) - base
+            self.drag_mode = "rotate_" + rt
+            self.start_fast_drag()
+            return
         fh = self.hit_float_handle(x, y)
         if fh is not None:
             self.drag_mode, self.handle_idx = "float_resize", fh
@@ -3379,6 +4132,21 @@ class SnapPatch(tk.Tk):
             self.float["y"] = y - self.float_off[1]
             self.request_render(fast=True)
             return
+        if self.drag_mode in ("rotate_float", "rotate_obj"):
+            ang = math.degrees(math.atan2(y - self.rot_centre[1], x - self.rot_centre[0])) - self.rot_start
+            if e.state & 0x1:                       # Shift: snap to 15° steps
+                ang = round(ang / 15) * 15
+            ang = round(ang) % 360
+            if self.drag_mode == "rotate_float":
+                if ang != self.float["angle"]:
+                    self.float["angle"] = ang
+                    self.rebuild_float(final=False)
+                    self.request_render(fast=True)
+            else:
+                if ang != self.sel_obj.get("angle", 0):
+                    self.sel_obj["angle"] = ang
+                    self.request_render(fast=True)
+            return
         if self.drag_mode == "float_resize":
             ax, ay = self.float_anchor
             w, h = abs(x - ax), abs(y - ay)
@@ -3424,11 +4192,19 @@ class SnapPatch(tk.Tk):
                                 arrowshape=(16, 20, 6), tags="tmp")
         else:
             color = {"crop": "#00c853", "erase": "#ff1744", "rect": self.ann_color, "rrect": self.ann_color,
-                     "frect": self.ann_color, "ellipse": self.ann_color, "spotlight": "#ffffff",
+                     "frect": self.ann_color, "ellipse": self.ann_color, "star": self.ann_color,
+                     "triangle": self.ann_color, "diamond": self.ann_color, "arc": self.ann_color,
+                     "spotlight": "#ffffff",
                      "highlight": HIGHLIGHT_COLOR, "blur": "#888888"}.get(t, ACCENT)
             x0, y0, x1, y1 = min(sx, ex), min(sy, ey), max(sx, ex), max(sy, ey)
             if t == "ellipse":
                 self.cv.create_oval(x0, y0, x1, y1, outline=color, width=2, tags="tmp")
+            elif t == "arc":
+                self.cv.create_arc(x0, y0, x1, y1, start=0, extent=-90, style="arc", outline=self.ann_color,
+                                   width=2, tags="tmp")
+            elif t in ("star", "triangle", "diamond"):
+                pts = shape_points(t, (x0, y0, x1, y1))
+                self.cv.create_polygon(*[v for p in pts for v in p], outline=color, fill="", width=2, tags="tmp")
             elif t == "highlight":
                 self.cv.create_rectangle(x0, y0, x1, y1, outline=color, fill=color, stipple="gray50", tags="tmp")
             else:
@@ -3443,10 +4219,14 @@ class SnapPatch(tk.Tk):
             return
         mode, self.drag_mode = self.drag_mode, None
         self.cv.delete("tmp")
-        if mode in ("float", "float_resize", "obj", "handle"):
+        if mode in ("float", "float_resize", "obj", "handle", "rotate_float", "rotate_obj"):
             if mode == "float_resize" and self.float:
-                self.resize_float(*self.float["img"].size, final=True)
-                self.float["img"] = self.float["orig"].resize(self.float["img"].size, Image.LANCZOS)
+                self.resize_float(*self.float["size"], final=True)
+                self.schedule_context()
+            if mode == "rotate_float" and self.float:
+                self.rebuild_float(final=True)
+                self.schedule_context()
+            if mode == "rotate_obj":
                 self.schedule_context()
             if mode in ("obj", "handle") and self.sel_obj is not None:
                 norm_obj(self.sel_obj)
@@ -3466,13 +4246,15 @@ class SnapPatch(tk.Tk):
                 if abs(pt[0] - slim[-1][0]) + abs(pt[1] - slim[-1][1]) >= 2:
                     slim.append(pt)
             if len(slim) > 1:
-                self.add_object({"type": "pen", "pts": slim, "color": self.ann_color, "width": self.line_width.get()})
+                self.add_object({"type": "pen", "pts": slim, "color": self.ann_color, "width": self.line_width.get(),
+                                 "dash": self.draw_dashed.get(), "midarrow": self.draw_midarrow.get()})
             return
         if t in LINE_TYPES:
             if abs(end[0] - self.start[0]) + abs(end[1] - self.start[1]) > 2:
                 self.add_object({"type": t, "x0": self.start[0], "y0": self.start[1],
                                  "x1": end[0], "y1": end[1], "color": self.ann_color,
-                                 "width": self.line_width.get()})
+                                 "width": self.line_width.get(), "dash": self.draw_dashed.get(),
+                                 "midarrow": self.draw_midarrow.get()})
             return
         box = norm_box(self.start, end)
         if box[2] - box[0] <= 2 and box[3] - box[1] <= 2 and t in ("select", "erase", "crop", "blur", "highlight",
@@ -3515,6 +4297,10 @@ class SnapPatch(tk.Tk):
                 o["block"] = 8
             if t in ("frect", "spotlight"):
                 o["alpha"] = 90 if t == "frect" else 150
+            if t in DASHABLE:
+                o["dash"] = self.draw_dashed.get()
+            if t == "arc":
+                o.update(start=0, end=90, heads=True)
             self.add_object(o)
 
     def on_double(self, e):
@@ -3567,11 +4353,74 @@ class SnapPatch(tk.Tk):
         self.render()
         self.select_object(o)
 
+    def _spin_angle(self, var, set_angle):
+        try:
+            set_angle(float(var.get()))
+        except (ValueError, tk.TclError):
+            pass
+
+    def rotate_object(self, delta=None, absolute=None):
+        o = self.sel_obj
+        if o is None or o["type"] not in ROTATABLE:
+            return
+        new = (absolute if absolute is not None else o.get("angle", 0) + delta) % 360
+        if new == o.get("angle", 0) % 360:
+            return
+        self.push_undo()
+        o["angle"] = new
+        self.render()
+        self.schedule_context()
+
+    def rotate_selected(self, delta):
+        """Ctrl+[ / Ctrl+] : rotate the selected annotation or the pasted piece."""
+        if self.float:
+            self.rotate_float(delta=delta)
+        elif self.sel_obj is not None:
+            self.rotate_object(delta=delta)
+
+    def set_obj_prop(self, key, value):
+        if self.sel_obj is None or self.sel_obj.get(key) == value:
+            return
+        self.push_undo()
+        self.sel_obj[key] = value
+        self.render()
+
+    def _set_num_prop(self, key, var):
+        try:
+            self.set_obj_prop(key, float(var.get()))
+        except (ValueError, tk.TclError):
+            pass
+
+    def place_symbol(self, kind, x, y):
+        sizes = {"probe": (26, 70), "ruby": (26, 70), "thermo": (22, 70), "stopwatch": (44, 52)}
+        w, h = sizes.get(kind, (44, 44))
+        self.add_object({"type": "symbol", "kind": kind, "x0": x - w // 2, "y0": y - h // 2,
+                         "x1": x - w // 2 + w, "y1": y - h // 2 + h, "color": self.ann_color,
+                         "width": self.line_width.get()})
+        self.set_status("Symbol placed – drag to move, corner handles to resize, ↻ to rotate.")
+
     def add_click_object(self, t, x, y):
         if t == "step":
             n = max([o["n"] for o in self.objects if o["type"] == "step"] + [0]) + 1
             self.add_object({"type": "step", "x0": x, "y0": y, "n": n,
                              "color": self.ann_color, "size": self.font_size.get()})
+            return
+        if t == "symbol":
+            m = tk.Menu(self, tearoff=False)
+            for kind, name in SYMBOLS:
+                m.add_command(label=name, command=lambda k=kind: self.place_symbol(k, x, y))
+            folder = self.settings.get("symbol_dir")
+            if folder and os.path.isdir(folder):
+                files = sorted(f for f in os.listdir(folder) if f.lower().endswith((".png", ".bmp", ".jpg")))
+                if files:
+                    m.add_separator()
+                    for f in files[:40]:
+                        m.add_command(label=f"Image: {f}", command=lambda f=f: self.insert_symbol_file(
+                            os.path.join(folder, f), x, y))
+            m.add_separator()
+            m.add_command(label="Choose a folder of symbol images (e.g. the imagesource/objects repo)…",
+                          command=self.choose_symbol_dir)
+            m.tk_popup(self.winfo_pointerx(), self.winfo_pointery())
             return
         d = TextDialog(self, "Add text" if t == "text" else "Add callout")
         if not d.result:
@@ -3739,6 +4588,8 @@ class SnapPatch(tk.Tk):
         self.push_undo()
         if piece.mode not in ("RGB", "RGBA"):
             piece = piece.convert("RGBA")
+        if getattr(self, "help_preset", None):
+            piece = self.match_help_background(piece)
         if self.sel:
             x, y = self.sel[:2]
         else:
@@ -3940,6 +4791,24 @@ class SnapPatch(tk.Tk):
             self.deiconify()
             self.lift()
             return
+        RecordCountdown(self, bbox, on_go=lambda: self._start_recording(bbox),
+                        on_screenshot=lambda: self._screenshot_instead(bbox),
+                        on_cancel=lambda: (self.deiconify(), self.lift()))
+
+    def _screenshot_instead(self, bbox):
+        """Countdown: user chose a still image of the same area instead of a video."""
+        try:
+            try:
+                img = ImageGrab.grab(bbox=bbox, all_screens=True)
+            except TypeError:
+                img = ImageGrab.grab(bbox=bbox)
+            self._on_region(img.convert("RGB"))
+        except Exception as ex:
+            log.exception("screenshot instead of recording failed")
+            self.deiconify()
+            messagebox.showerror(APP_NAME, f"Screenshot failed:\n{ex}", parent=self)
+
+    def _start_recording(self, bbox):
         try:
             LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
             path = LIBRARY_DIR / f"Record_{datetime.now():%Y%m%d_%H%M%S}.mp4"
@@ -4046,6 +4915,8 @@ class SnapPatch(tk.Tk):
             self.undo_stack.clear()
             self.redo_stack.clear()
         self.img, self.path, self.sel, self.float = img, path, None, None
+        # a new image leaves help-image mode unless it already has a help-canvas size
+        self.help_preset = next((n for n, (w, h, _) in HELP_PRESETS.items() if img.size == (w, h)), None)
         self.objects, self.sel_obj = (objects or []), None
         self.dirty = path is None
         self.update_title()
@@ -4208,9 +5079,21 @@ class SnapPatch(tk.Tk):
         flat = self.flattened()
         target = flat.crop(self.sel) if self.sel else flat
         try:
-            copy_image_to_clipboard(target, self.winfo_id())
-            self.set_status(f"Copied {'selection' if self.sel else 'image'} ({target.width} × {target.height}) to the "
-                            "clipboard – Ctrl+V pastes it here as a layer, or into Teams / Word / Outlook.")
+            # also write a PNG so Ctrl+V works in Explorer / Outlook attachments (not just Excel / PowerPoint)
+            clip_dir = LIBRARY_DIR / "clipboard"
+            clip_dir.mkdir(parents=True, exist_ok=True)
+            for old in sorted(clip_dir.glob("*.png"), key=lambda p: p.stat().st_mtime)[:-10]:
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+            base = Path(self.path).stem if self.path else "SnapPatch"
+            fpath = clip_dir / f"{base}_{datetime.now():%Y%m%d_%H%M%S}.png"
+            target.save(fpath)
+            copy_image_to_clipboard(target, self.winfo_id(), fpath)
+            self.set_status(f"Copied {'selection' if self.sel else 'image'} ({target.width} × {target.height}) – "
+                            "Ctrl+V pastes it into Teams / Word / Excel / PowerPoint, into a folder as a PNG file, "
+                            "or back here as a layer.")
         except Exception as ex:
             log.exception("copy failed")
             messagebox.showerror(APP_NAME, str(ex), parent=self)
