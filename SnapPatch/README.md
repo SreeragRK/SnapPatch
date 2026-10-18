@@ -54,7 +54,8 @@ Defaults are **Ctrl+Shift+F9** (capture) and **Ctrl+Shift+F10** (record) — com
 
 Press **Ctrl+Shift+F10** anywhere (or the alternative SnapPatch told you about at start-up), or click **● Record**. You can also press the capture hotkey and switch to **Video** on the capture screen: click the Image / Video switch at the top, or press **Tab**. Pick the area the same way as for a capture: hover and click, or drag.
 
-- A control bar appears above the area with the elapsed time, the size and frame rate, **Pause**, **Stop & save** and **✕** (discard). A red frame shows what is being recorded. Drag the bar if it's in the way.
+- A **4 · 3 · 2 · 1 countdown** appears above the area first. During it you can click **Screenshot instead** (S) to take a still of the same area, **Start now** (Enter), or **Cancel** (Esc).
+- Then a control bar appears above the area with the elapsed time, the size and frame rate, **Pause**, **Stop & save** and **✕** (discard). A red frame shows what is being recorded. Drag the bar if it's in the way.
 - The same hotkey again, Esc on the bar, or the Stop button ends the recording.
 - Videos are saved as MP4 (H.264) in `Pictures\SnapPatch` and appear in the History strip. The video editor opens as soon as you stop.
 - File → Recording frame rate sets 8 to 30 frames per second. 12 is a good default for screen demos.
@@ -80,6 +81,12 @@ The strip along the bottom shows your captures and recordings, newest first. The
 - **Right-click** an image to copy it to the clipboard, paste it into the current image as a layer, copy its path or delete it.
 - **Open folder** opens the folder in Explorer. View → History strip hides or shows the strip.
 
+## Worksheet
+
+**▦ New** (Ctrl+Shift+N) creates a blank worksheet — pick a size (Full HD, A4, custom…) and background — to arrange several captures on one page: Ctrl+V each capture as a layer, or right-click a History thumbnail → *Paste into current image as layer*; drag, resize, rotate, Enter. Save it like any image or as a `.snappatch` project to keep editing later.
+
+**Copy (Ctrl+C) now works everywhere:** the clipboard gets the image *and* a PNG file, so Ctrl+V pastes into Excel, PowerPoint, Word, Teams — and also straight into a folder in Explorer or as an Outlook attachment.
+
 ## Editing
 
 The tool palette is on the left. Hover over a tool to see its tip. The blue bar above the image shows only the options that apply to what you're doing.
@@ -90,7 +97,8 @@ The tool palette is on the left. Hover over a tool to see its tip. The blue bar 
   - **Move:** drag a selected area somewhere else. The hole it leaves is filled automatically.
   - **Crop:** click an element or drag the area you want to keep.
   - **Erase:** click an element or drag over anything to remove it. The gap is filled to match the surroundings — stripes, gradients and table rows are continued, so there's nothing to pick. (Turn off *Auto fill colour* only if you want a fixed colour.)
-- **Annotations** stay editable: box, rounded box, filled box, ellipse, arrow, double arrow, line, freehand pen, highlight, spotlight (darkens everything else), blur, text, callout and step numbers.
+- **Annotations** stay editable: box, rounded box, filled box, ellipse, star, triangle, diamond, arrow, double arrow, line, freehand pen, highlight, spotlight (darkens everything else), blur, text, callout and step numbers. Boxes, ellipses and the star/triangle/diamond shapes have a *Filled* tick-box in the bar.
+- **Rotate anything:** select an annotation (or a pasted piece) and drag the **↻ handle** that appears above it — hold Shift to snap to 15° steps. You can also use the ↺ / ↻ buttons or the degrees box in the bar, or press **Ctrl+[** / **Ctrl+]** for 5° steps. Text, callouts, shapes, arrows, pen strokes and pasted images all rotate. (A rotated shape is moved and restyled as usual; set the angle back to 0 to resize it with handles.)
   - **Click** one to select it.
   - **Drag** it to move it. Drag a handle to resize it.
   - **Change the colour, width or size** in the blue bar to restyle it.
@@ -99,6 +107,23 @@ The tool palette is on the left. Hover over a tool to see its tip. The blue bar 
 - **Right-click** anywhere for the actions that apply at that spot.
 - **Pasted or duplicated pieces:** drag to move, drag a corner handle to resize (proportional; hold Shift for free resize), or type a Scale % in the blue bar. *Original size* undoes the resize. Enter applies the piece and Esc cancels it.
 - **Zoom:** Ctrl+mouse wheel zooms in and out around the cursor.
+
+## ToolRoom help images
+
+The **Help image** menu follows the *Help Image Design Guide* (AMT ToolRoom KB on Confluence) so a compliant image takes a minute:
+
+1. **Help image → New help image** and pick the size: ToolRoom 268 × 358, BlankX 265 × 265, or TGP 270 × 149 (jpg). You get a green RGB(0,75,44) canvas and the pen is set to the guideline orange.
+2. **Ctrl+V** pastes your CIM3D view as a layer — drag, resize and rotate it into place, Enter to apply. (Have colour mapping and edge highlighting off in CIM3D.) While in help mode, the pasted image's own background (CIM3D's grey, or its slightly different green) is converted to the exact guideline green automatically, so no rectangle shows around it.
+3. If an edge still shows, **Help image → Replace background** and click the offending colour.
+4. Help-image drawing tools (all in the guideline colours, all rotatable):
+   - **Dashed** tick-box (bar) for reference lines, dashed boxes/ellipses and dashed arcs.
+   - **Arrows along path** tick-box: arrowheads in the middle of a line or pen stroke to show direction of travel (the purple path style).
+   - **Angle arc** tool (Q): drag a box, set Start/End degrees in the bar; arrowheads on both ends, Dashed for reference arcs.
+   - **Symbol** tool (X): click to place the standard probe, ruby probe, stopwatch, thermometer, the red "no" sign, +/−/±, or clockwise / anti-clockwise rotation. Resize with the handles. *Choose a folder of symbol images…* lets you point it at a checkout of the `imagesource/objects` repo so the real object PNGs appear in the same menu.
+   Draw with the three colour buttons in the bar: **Arrow / dimension** (orange 248,113,0), **Reference line** (purple 165,35,210), **Axis line** (black). Use arrows to show +/− direction; numbers and operators are fine, words are not.
+5. **Check** lists anything that breaks the guide (size, non-guideline colours, words in text, wrong background). **Export** (Ctrl+Shift+E) writes the PNG (or JPG for TGP) at the exact size.
+
+Already have a screenshot? **Help image → Fit current image onto a help canvas** scales it and its annotations onto the green canvas.
 
 ## Saving
 
@@ -127,4 +152,4 @@ The tool palette is on the left. Hover over a tool to see its tip. The blue bar 
 | Ctrl+0 | Fit the image to the window |
 | Ctrl+1 | Zoom to 100% |
 
-Tool shortcuts: S select · M move · C crop · E erase · B box · R rounded box · F filled box · O ellipse · A arrow · D double arrow · L line · P pen · H highlight · G spotlight · U blur · T text · K callout · N step · I pick colour
+Tool shortcuts: S select · M move · C crop · E erase · B box · R rounded box · F filled box · O ellipse · J star · Y triangle · W diamond · A arrow · D double arrow · L line · P pen · H highlight · G spotlight · U blur · T text · K callout · N step · I pick colour
